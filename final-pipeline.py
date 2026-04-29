@@ -38,14 +38,13 @@ class Seasonal:
         print(f"Optimized weights: daily={self.daily_weight:.3f}, weekly={self.weekly_weight:.3f}")
         return self
 
-    def predict(self, train_data, steps=168):
-        train_arr = train_data.values if hasattr(train_data, 'values') else train_data
+    def predict(self, context_window, steps=168):
         preds = []
         for t in range(steps):
-            daily_idx = len(train_arr) - 24 + (t % 24)
-            weekly_idx = len(train_arr) - 168 + (t % 168)
-            daily_val = train_arr[daily_idx] if daily_idx >= 0 else train_arr[-1]
-            weekly_val = train_arr[weekly_idx] if weekly_idx >= 0 else train_arr[-1]
+            daily_idx = len(context_window) - 24 + (t % 24)
+            weekly_idx = len(context_window) - 168 + (t % 168)
+            daily_val = context_window[daily_idx] if daily_idx >= 0 else context_window[-1]
+            weekly_val = context_window[weekly_idx] if weekly_idx >= 0 else context_window[-1]
             pred = self.daily_weight * daily_val + self.weekly_weight * weekly_val
             preds.append(pred)
         return np.array(preds)
@@ -57,17 +56,25 @@ class Ensemble:
         self.lr_model = None
         self.xgb_models = None
         self.daily_pattern = None
-        self.train_data = None
+        self.context_window = None
         self.seasonal_weights = None
         self.ensemble_weights = None
         self.threshold = 0.5
         self.validation_performance = {}
         self.metadata = {}
 
-    def predict(self, train_data, steps=168):
-        seasonal_pred = self.seasonal_model.predict(train_data, steps)
-        lr_pred = self._predict_lr(train_data, steps)
-        xgb_pred = self._predict_xgb(train_data, steps)
+    def set_context(self, train_data):
+        train_arr = train_data.values if hasattr(train_data, 'values') else train_data
+        self.context_window = train_arr[-168:].copy()
+        print(f"Context window saved: shape={self.context_window.shape}")
+        return self
+
+    def predict(self, steps=168):
+        if self.context_window is None:
+            raise ValueError("Context window not set. Call set_context() first.")
+        seasonal_pred = self.seasonal_model.predict(self.context_window, steps)
+        lr_pred = self._predict_lr(steps)
+        xgb_pred = self._predict_xgb(steps)
         w_s, w_l, w_x = self.ensemble_weights
         ensemble_pred = (w_s * seasonal_pred + w_l * lr_pred + w_x * xgb_pred)
         if self.daily_pattern is not None:
@@ -76,10 +83,9 @@ class Ensemble:
                 ensemble_pred[t] = 0.85 * ensemble_pred[t] + 0.15 * self.daily_pattern[hour]
         return np.maximum(ensemble_pred, 0)
 
-    def _predict_lr(self, train_data, steps=168):
-        train_arr = train_data.values if hasattr(train_data, 'values') else train_data
-        lr_pred = np.zeros((steps, train_arr.shape[1]))
-        last_window = train_arr[-24:].copy()
+    def _predict_lr(self, steps=168):
+        lr_pred = np.zeros((steps, self.context_window.shape[1]))
+        last_window = self.context_window[-24:].copy()
         for t in range(steps):
             features = last_window.flatten()
             features = np.append(features, last_window.mean(axis=0))
@@ -89,11 +95,10 @@ class Ensemble:
             last_window = np.vstack([last_window[1:], pred])
         return np.maximum(lr_pred, 0)
 
-    def _predict_xgb(self, train_data, steps=168):
-        train_arr = train_data.values if hasattr(train_data, 'values') else train_data
-        xgb_pred = np.zeros((steps, train_arr.shape[1]))
+    def _predict_xgb(self, steps=168):
+        xgb_pred = np.zeros((steps, self.context_window.shape[1]))
         for beam_idx, model in self.xgb_models.items():
-            beam_data = train_arr[:, beam_idx]
+            beam_data = self.context_window[:, beam_idx]
             beam_log = np.log1p(beam_data)
             last_168 = beam_log[-168:]
             preds_log = []
@@ -165,11 +170,9 @@ class Trainer:
         if val_df is not None:
             self.val_data = val_df.values.astype(np.float32)
         else:
-            # Используем последние 168 семплов для валидации
             self.val_data = self.train_data[-168:].copy()
             self.train_data = self.train_data[:-168].copy()
             self.train_df = self.train_df.iloc[:-168]
-        # Удаляем лишние колонки если есть
         if self.train_data.shape[1] == 2881:
             self.train_data = self.train_data[:, 1:]
             self.val_data = self.val_data[:, 1:]
@@ -192,7 +195,7 @@ class Trainer:
         print("Training Seasonal Model...")
         self.seasonal_model = Seasonal()
         self.seasonal_model.fit(self.train_df, self.val_data)
-        self.seasonal_pred = self.seasonal_model.predict(self.train_df, steps=len(self.val_data))
+        self.seasonal_pred = self.seasonal_model.predict(self.train_data[-168:], steps=len(self.val_data))
         return self
 
     def train_linear_regression(self):
@@ -230,7 +233,6 @@ class Trainer:
         for beam_idx in tqdm(range(self.n_beams), desc="Training XGBoost"):
             beam_data = self.train_data[:, beam_idx]
             if beam_data.std() < 1e-6:
-                print(f"Skipping beam {beam_idx} (constant/zero values)")
                 continue
             beam_log = np.log1p(beam_data)
             X_beam, y_beam = [], []
@@ -242,7 +244,6 @@ class Trainer:
                 X_beam.append(features)
                 y_beam.append(beam_log[t])
             if len(X_beam) < 100:
-                print(f"Skipping beam {beam_idx} (insufficient samples: {len(X_beam)})")
                 continue
             X_beam = np.array(X_beam)
             y_beam = np.array(y_beam)
@@ -326,6 +327,7 @@ class Trainer:
         ensemble.daily_pattern = self.daily_pattern
         ensemble.ensemble_weights = self.ensemble_weights
         ensemble.threshold = 0.5
+        ensemble.set_context(self.train_df)
         metrics = ensemble.calculate_metrics(self.val_data, self.ensemble_pred, threshold=0.5)
         metrics['mae'] = mean_absolute_error(self.val_data.flatten(), self.ensemble_pred.flatten())
         ensemble.validation_performance = metrics
@@ -349,9 +351,9 @@ class Trainer:
         return self.build_ensemble_object()
 
 
-def evaluate_on_test(ensemble, test_data, train_data_for_prediction):
+def evaluate_on_test(ensemble, test_data):
     print(f"Generating predictions for {len(test_data)} timesteps...")
-    test_predictions = ensemble.predict(train_data_for_prediction, steps=len(test_data))
+    test_predictions = ensemble.predict(steps=len(test_data))
     test_metrics = ensemble.calculate_metrics(test_data, test_predictions, threshold=0.5)
     test_metrics['mae'] = mean_absolute_error(test_data.flatten(), test_predictions.flatten())
     print("Test Set Metrics:")
@@ -369,7 +371,7 @@ if __name__ == "__main__":
     print("Loading data...")
     train_df = pd.read_csv('data/MR_number_train_0w-5w.csv.zip', index_col=0)
     test_df = pd.read_csv('data/MR_number_test_5w-6w.csv.zip', index_col=0)
-    val_size = 168  # 1 week of validation
+    val_size = 168
     train_size = len(train_df) - val_size
     train_split_df = train_df.iloc[:train_size]
     val_split_df = train_df.iloc[train_size:]
@@ -380,7 +382,7 @@ if __name__ == "__main__":
     print(f"Number of beams: {train_split_df.shape[1]}")
     trainer = Trainer(
         train_df=train_split_df,
-        val_df=val_split_df  # Валидацию берем с конца обучающей выборки
+        val_df=val_split_df
     )
     ensemble = trainer.train_complete()
     print("Validation performance (on held-out validation set)")
@@ -390,11 +392,10 @@ if __name__ == "__main__":
     print(f"F1 Score: {ensemble.validation_performance['f1_score']:.4f}")
     print(f"Average Precision: {ensemble.validation_performance['average_precision']:.4f}")
     ensemble.save('models/ensemble_model.joblib', compress=9)
-    print("Evaluate in test data (post - training)")
+    print("Evaluate in test data (post-training)")
     test_metrics, test_predictions = evaluate_on_test(
         ensemble=ensemble,
-        test_data=test_df.values.astype(np.float32),
-        train_data_for_prediction=train_df  # Нужно передавать все данные на которых было обучение в контекст.
+        test_data=test_df.values.astype(np.float32)
     )
     test_predictions_df = pd.DataFrame(
         test_predictions,
