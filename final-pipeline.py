@@ -253,7 +253,7 @@ class Trainer:
                 learning_rate=0.05,
                 subsample=0.8,
                 random_state=42,
-                n_jobs=1,
+                n_jobs=-1, #FIXME: do, ``brew install libomp`` before
                 verbosity=0
             )
             model.fit(X_beam, y_beam)
