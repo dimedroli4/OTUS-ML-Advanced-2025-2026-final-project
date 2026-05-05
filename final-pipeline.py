@@ -26,8 +26,8 @@ class Seasonal:
             for t in range(len(val_arr)):
                 daily_idx = len(train_arr) - 24 + (t % 24)
                 weekly_idx = len(train_arr) - 168 + (t % 168)
-                daily_val = train_arr[daily_idx] if daily_idx >= 0 else train_arr[-1]
-                weekly_val = train_arr[weekly_idx] if weekly_idx >= 0 else train_arr[-1]
+                daily_val = train_arr[daily_idx]
+                weekly_val = train_arr[weekly_idx]
                 pred = daily_w * daily_val + weekly_w * weekly_val
                 preds.append(pred)
             preds = np.array(preds)
@@ -43,8 +43,8 @@ class Seasonal:
         for t in range(steps):
             daily_idx = len(context_window) - 24 + (t % 24)
             weekly_idx = len(context_window) - 168 + (t % 168)
-            daily_val = context_window[daily_idx] if daily_idx >= 0 else context_window[-1]
-            weekly_val = context_window[weekly_idx] if weekly_idx >= 0 else context_window[-1]
+            daily_val = context_window[daily_idx]
+            weekly_val = context_window[weekly_idx]
             pred = self.daily_weight * daily_val + self.weekly_weight * weekly_val
             preds.append(pred)
         return np.array(preds)
@@ -96,20 +96,24 @@ class Ensemble:
         return np.maximum(lr_pred, 0)
 
     def _predict_xgb(self, steps=168):
-        xgb_pred = np.zeros((steps, self.context_window.shape[1]))
-        for beam_idx, model in self.xgb_models.items():
+        n_beams = self.context_window.shape[1]
+        xgb_pred = np.zeros((steps, n_beams))
+        for beam_idx in range(n_beams):
+            if beam_idx not in self.xgb_models:
+                xgb_pred[:, beam_idx] = self.context_window[-1, beam_idx]
+                continue
+            model = self.xgb_models[beam_idx]
             beam_data = self.context_window[:, beam_idx]
             beam_log = np.log1p(beam_data)
-            last_168 = beam_log[-168:]
-            preds_log = []
-            current = last_168.copy()
-            for _ in range(steps):
-                features = current.tolist()
-                features.append(current[-24:].mean())
-                features.append(current.mean())
-                features.append(current[-24:].std())
-                pred_log = model.predict(np.array(features).reshape(1, -1))[0]
-                preds_log.append(pred_log)
+            current = beam_log[-168:].copy()
+            preds_log = np.zeros(steps)
+            for t in range(steps):
+                features = np.concatenate([
+                    current,
+                    [current[-24:].mean(), current.mean(), current[-24:].std()]
+                ])
+                pred_log = model.predict(features.reshape(1, -1))[0]
+                preds_log[t] = pred_log
                 current = np.roll(current, -1)
                 current[-1] = pred_log
             xgb_pred[:, beam_idx] = np.expm1(preds_log)
@@ -124,7 +128,7 @@ class Ensemble:
             'precision': precision_score(y_true_flat, y_pred_flat, zero_division=0),
             'recall': recall_score(y_true_flat, y_pred_flat, zero_division=0),
             'f1_score': f1_score(y_true_flat, y_pred_flat, zero_division=0),
-            'average_precision': average_precision_score(y_true_flat, y_pred_flat),
+            'average_precision': average_precision_score(y_true_flat, y_pred.flatten()),
             'threshold': threshold,
             'actual_active_rate': y_true_binary.mean(),
             'pred_active_rate': y_pred_binary.mean()
@@ -296,9 +300,7 @@ class Trainer:
             pred = (w_s * self.seasonal_pred + w_l * self.lr_pred + w_x * self.xgb_pred)
             return mean_absolute_error(val_actual.flatten(), pred.flatten())
 
-        result = minimize(ensemble_loss, [0.2, 0.3, 0.5],
-                          bounds=[(0, 1), (0, 1), (0, 1)],
-                          method='L-BFGS-B')
+        result = minimize(ensemble_loss, [0.3, 0.3, 0.4], bounds=[(0, 1), (0, 1), (0, 1)], method='L-BFGS-B')
         w_s, w_l, w_x = result.x
         w_sum = w_s + w_l + w_x
         self.ensemble_weights = [w_s/w_sum, w_l/w_sum, w_x/w_sum]
